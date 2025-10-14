@@ -28,7 +28,9 @@ const RAW_PROXY_LIST_FILE = "./data/RawProxy.txt";
 const PROXY_LIST_FILE = "./data/proxy.txt";
 const IP_RESOLVER_DOMAIN = "myip.ipeek.workers.dev";
 const IP_RESOLVER_PATH = "/";
-const CONCURRENCY = 99; // Reduced for stability
+const CONCURRENCY = 99;
+
+const CHECK_QUEUE: string[] = [];
 
 async function sendRequest(host: string, path: string, proxy: any = null) {
   return new Promise((resolve, reject) => {
@@ -40,10 +42,7 @@ async function sendRequest(host: string, path: string, proxy: any = null) {
 
     const socket = tls.connect(options, () => {
       const request =
-        `GET ${path} HTTP/1.1\r\n` +
-        `Host: ${host}\r\n` +
-        `User-Agent: Mozilla/5.0\r\n` +
-        `Connection: close\r\n\r\n`;
+        `GET ${path} HTTP/1.1\r\n` + `Host: ${host}\r\n` + `User-Agent: Mozilla/5.0\r\n` + `Connection: close\r\n\r\n`;
       socket.write(request);
     });
 
@@ -52,7 +51,7 @@ async function sendRequest(host: string, path: string, proxy: any = null) {
     const timeout = setTimeout(() => {
       socket.destroy();
       reject(new Error("socket timeout"));
-    }, 10000); // Increased timeout
+    }, 5000);
 
     socket.on("data", (data) => (responseBody += data.toString()));
     socket.on("end", () => {
@@ -61,13 +60,13 @@ async function sendRequest(host: string, path: string, proxy: any = null) {
       resolve(body);
     });
     socket.on("error", (error) => {
-      clearTimeout(timeout);
+      // console.log(error);
       reject(error);
     });
   });
 }
 
-async function checkProxy(proxyAddress: string, proxyPort: number): Promise<ProxyTestResult> {
+export async function checkProxy(proxyAddress: string, proxyPort: number): Promise<ProxyTestResult> {
   let result: ProxyTestResult = {
     message: "Unknown error",
     error: true,
@@ -76,12 +75,12 @@ async function checkProxy(proxyAddress: string, proxyPort: number): Promise<Prox
   const proxyInfo = { host: proxyAddress, port: proxyPort };
 
   try {
-    const start = Date.now();
+    const start = new Date().getTime();
     const [ipinfo, myip] = await Promise.all([
       sendRequest(IP_RESOLVER_DOMAIN, IP_RESOLVER_PATH, proxyInfo),
       myGeoIpString == null ? sendRequest(IP_RESOLVER_DOMAIN, IP_RESOLVER_PATH, null) : myGeoIpString,
     ]);
-    const finish = Date.now();
+    const finish = new Date().getTime();
 
     // Save local geoip
     if (myGeoIpString == null) myGeoIpString = myip;
@@ -94,16 +93,12 @@ async function checkProxy(proxyAddress: string, proxyPort: number): Promise<Prox
         error: false,
         result: {
           proxy: proxyAddress,
-          proxyip: true,
-          ip: parsedIpInfo.ip,
           port: proxyPort,
+          proxyip: true,
           delay: finish - start,
-          country: parsedIpInfo.country || "Unknown",
-          asOrganization: parsedIpInfo.org || parsedIpInfo.asOrganization || "Unknown",
+          ...parsedIpInfo,
         },
       };
-    } else {
-      result.message = "IP tidak berbeda (bukan proxy)";
     }
   } catch (error: any) {
     result.message = error.message;
@@ -112,211 +107,116 @@ async function checkProxy(proxyAddress: string, proxyPort: number): Promise<Prox
   return result;
 }
 
+// async function checkProxy(proxyAddress: string, proxyPort: number): Promise<ProxyTestResult> {
+//   const controller = new AbortController();
+//   setTimeout(() => controller.abort(), 5000);
+
+//   try {
+//     const res = await Bun.fetch(IP_RESOLVER_DOMAIN + `?ip=${proxyAddress}:${proxyPort}`, {
+//       signal: controller.signal,
+//     });
+
+//     if (res.status == 200) {
+//       return {
+//         error: false,
+//         result: await res.json(),
+//       };
+//     } else {
+//       throw new Error(res.statusText);
+//     }
+//   } catch (e: any) {
+//     return {
+//       error: true,
+//       message: e.message,
+//     };
+//   }
+// }
+
 async function readProxyList(): Promise<ProxyStruct[]> {
   const proxyList: ProxyStruct[] = [];
 
-  try {
-    const file = Bun.file(RAW_PROXY_LIST_FILE);
-    if (!(await file.exists())) {
-      console.error(`❌ File ${RAW_PROXY_LIST_FILE} tidak ditemukan!`);
-      return proxyList;
-    }
-
-    const content = await file.text();
-    if (!content.trim()) {
-      console.error(`❌ File ${RAW_PROXY_LIST_FILE} kosong!`);
-      return proxyList;
-    }
-
-    const proxyListString = content.trim().split("\n");
-    console.log(`📄 Baris di RawProxy.txt: ${proxyListString.length}`);
-
-    for (const proxy of proxyListString) {
-      try {
-        const [address, port, country, org] = proxy.split(",");
-        if (address && port) {
-          proxyList.push({
-            address: address.trim(),
-            port: parseInt(port.trim()),
-            country: (country?.trim() || "Unknown").replace(/[^a-zA-Z]/g, ""),
-            org: (org?.trim() || "Unknown").replaceAll(/[+]/g, " "),
-          });
-        }
-      } catch (e) {
-        // Skip invalid lines
-        continue;
-      }
-    }
-
-    console.log(`🔢 Proxy valid: ${proxyList.length}`);
-  } catch (error) {
-    console.error("Error reading proxy list:", error);
+  const proxyListString = (await Bun.file(RAW_PROXY_LIST_FILE).text()).split("\n");
+  for (const proxy of proxyListString) {
+    const [address, port, country, org] = proxy.split(",");
+    proxyList.push({
+      address,
+      port: parseInt(port),
+      country,
+      org,
+    });
   }
 
   return proxyList;
 }
 
-async function processProxies(proxyList: ProxyStruct[]) {
+(async () => {
+  const proxyList = await readProxyList();
+  const proxyChecked: string[] = [];
   const uniqueRawProxies: string[] = [];
   const activeProxyList: string[] = [];
   const kvPair: any = {};
-  const proxyChecked = new Set<string>();
 
-  let successfulChecks = 0;
-  let failedChecks = 0;
+  let proxySaved = 0;
 
-  // Process proxies in batches
-  const batchSize = CONCURRENCY;
-  
-  for (let i = 0; i < proxyList.length; i += batchSize) {
-    const batch = proxyList.slice(i, i + batchSize);
-    console.log(`\n🔄 Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(proxyList.length / batchSize)}`);
-    
-    const promises = batch.map(async (proxy, index) => {
-      const proxyKey = `${proxy.address}:${proxy.port}`;
-      const globalIndex = i + index;
-      
-      // Skip duplicates
-      if (proxyChecked.has(proxyKey)) {
-        return null;
-      }
-      proxyChecked.add(proxyKey);
-
+  for (let i = 0; i < proxyList.length; i++) {
+    const proxy = proxyList[i];
+    const proxyKey = `${proxy.address}:${proxy.port}`;
+    if (!proxyChecked.includes(proxyKey)) {
+      proxyChecked.push(proxyKey);
       try {
-        // Add to raw list (format sesuai kebutuhan)
-        uniqueRawProxies.push(`${proxy.address},${proxy.port},${proxy.country},${proxy.org}`);
-        
-        // Check proxy
-        const res = await checkProxy(proxy.address, proxy.port);
-        
-        if (!res.error && res.result?.proxyip === true) {
-          const result = res.result;
-          const proxyString = `${result.proxy},${result.port},${result.country},${result.asOrganization}`;
-          activeProxyList.push(proxyString);
+        uniqueRawProxies.push(`${proxy.address},${proxy.port},${proxy.country},${proxy.org.replaceAll(/[+]/g, " ")}`);
+      } catch (e: any) {
+        continue;
+      }
+    } else {
+      continue;
+    }
 
-          // Update KV pairs
-          const country = result.country;
-          if (!kvPair[country]) {
-            kvPair[country] = [];
+    CHECK_QUEUE.push(proxyKey);
+    checkProxy(proxy.address, proxy.port)
+      .then((res) => {
+        if (!res.error && res.result?.proxyip === true && res.result.country) {
+          activeProxyList.push(
+            `${res.result?.proxy},${res.result?.port},${res.result?.country},${res.result?.asOrganization}`
+          );
+
+          if (kvPair[res.result.country] == undefined) kvPair[res.result.country] = [];
+          if (kvPair[res.result.country].length < 10) {
+            kvPair[res.result.country].push(`${res.result.proxy}:${res.result.port}`);
           }
-          if (kvPair[country].length < 10) {
-            kvPair[country].push(`${result.proxy}:${result.port}`);
-          }
-          
-          successfulChecks++;
-          console.log(`[${globalIndex + 1}/${proxyList.length}] ✅ ${proxyKey} (${result.delay}ms) - ${country}`);
-          return true;
-        } else {
-          failedChecks++;
-          console.log(`[${globalIndex + 1}/${proxyList.length}] ❌ ${proxyKey} - ${res.message}`);
-          return false;
+
+          proxySaved += 1;
+          console.log(`[${i}/${proxyList.length}] Proxy disimpan:`, proxySaved);
         }
-      } catch (error: any) {
-        failedChecks++;
-        console.log(`[${globalIndex + 1}/${proxyList.length}] 💥 ${proxyKey} - ${error.message}`);
-        return false;
-      }
-    });
-
-    await Promise.all(promises);
-    
-    // Progress update
-    const progress = ((i + batchSize) / proxyList.length * 100).toFixed(1);
-    console.log(`📊 Progress: ${progress}% | ✅ Success: ${successfulChecks} | ❌ Failed: ${failedChecks}`);
-    
-    // Delay between batches
-    if (i + batchSize < proxyList.length) {
-      console.log(`⏳ Waiting 2 seconds before next batch...`);
-      await Bun.sleep(2000);
-    }
-  }
-
-  console.log(`\n🎯 FINAL RESULTS:`);
-  console.log(`✅ Successful: ${successfulChecks}`);
-  console.log(`❌ Failed: ${failedChecks}`);
-  console.log(`📝 Unique proxies: ${uniqueRawProxies.length}`);
-  console.log(`🔥 Active proxies: ${activeProxyList.length}`);
-  console.log(`🌍 Countries: ${Object.keys(kvPair).length}`);
-
-  return { uniqueRawProxies, activeProxyList, kvPair };
-}
-
-(async () => {
-  try {
-    console.log("🚀 Starting proxy scanner...");
-    
-    // Ensure data directory exists
-    try {
-      await Bun.$`mkdir -p ./data`.quiet();
-    } catch (e) {
-      // Directory might already exist
-    }
-
-    const proxyList = await readProxyList();
-    
-    if (proxyList.length === 0) {
-      console.error("❌ No proxies to check! Exiting...");
-      process.exit(1);
-    }
-
-    console.log(`\n📋 Loaded ${proxyList.length} proxies for checking`);
-    
-    const { uniqueRawProxies, activeProxyList, kvPair } = await processProxies(proxyList);
-
-    // Sort results
-    uniqueRawProxies.sort(sortByCountry);
-    activeProxyList.sort(sortByCountry);
-
-    // Sort KV pairs by country name
-    const sortedKvPair: any = {};
-    Object.keys(kvPair).sort().forEach(key => {
-      sortedKvPair[key] = kvPair[key];
-    });
-
-    // Write files
-    console.log(`\n💾 Saving files...`);
-    
-    await Bun.write(KV_PAIR_PROXY_FILE, JSON.stringify(sortedKvPair, null, 2));
-    console.log(`✅ Saved: ${KV_PAIR_PROXY_FILE} (${Object.keys(sortedKvPair).length} countries)`);
-
-    await Bun.write(RAW_PROXY_LIST_FILE, uniqueRawProxies.join("\n"));
-    console.log(`✅ Saved: ${RAW_PROXY_LIST_FILE} (${uniqueRawProxies.length} proxies)`);
-
-    // Add header to proxy.txt
-    const timestamp = new Date().toISOString();
-    const proxyContent = `# Proxy List\n# Generated: ${timestamp}\n# Total Active: ${activeProxyList.length}\n# Countries: ${Object.keys(sortedKvPair).length}\n\n${activeProxyList.join("\n")}`;
-    await Bun.write(PROXY_LIST_FILE, proxyContent);
-    console.log(`✅ Saved: ${PROXY_LIST_FILE} (${activeProxyList.length} active proxies)`);
-
-    // Show sample output
-    if (activeProxyList.length > 0) {
-      console.log(`\n📋 Sample active proxies (first 5):`);
-      activeProxyList.slice(0, 5).forEach(proxy => console.log(`  ${proxy}`));
-    }
-
-    if (Object.keys(sortedKvPair).length > 0) {
-      console.log(`\n🌍 Countries found:`);
-      Object.keys(sortedKvPair).slice(0, 10).forEach(country => {
-        console.log(`  ${country}: ${sortedKvPair[country].length} proxies`);
+      })
+      .finally(() => {
+        CHECK_QUEUE.pop();
       });
-      if (Object.keys(sortedKvPair).length > 10) {
-        console.log(`  ... and ${Object.keys(sortedKvPair).length - 10} more countries`);
-      }
+
+    while (CHECK_QUEUE.length >= CONCURRENCY) {
+      await Bun.sleep(1);
     }
-
-    console.log(`\n🎉 Scan completed successfully!`);
-    console.log(`⏱️  Total time: ${(Bun.nanoseconds() / 1000000000).toFixed(2)} seconds`);
-
-  } catch (error) {
-    console.error("💥 Critical error:", error);
-    process.exit(1);
   }
-  
+
+  // Waiting for all process to be completed
+  while (CHECK_QUEUE.length) {
+    await Bun.sleep(1);
+  }
+
+  uniqueRawProxies.sort(sortByCountry);
+  activeProxyList.sort(sortByCountry);
+
+  await Bun.write(KV_PAIR_PROXY_FILE, JSON.stringify(kvPair, null, "  "));
+  await Bun.write(RAW_PROXY_LIST_FILE, uniqueRawProxies.join("\n"));
+  await Bun.write(PROXY_LIST_FILE, activeProxyList.join("\n"));
+
+  console.log(`Waktu proses: ${(Bun.nanoseconds() / 1000000000).toFixed(2)} detik`);
   process.exit(0);
 })();
 
 function sortByCountry(a: string, b: string) {
-  const countryA = a.split(",")[2] || "Unknown";
-  const countryB = b.split(",")[2] || "Unknown";
-  return countryA.localeCompare(countryB);
+  a = a.split(",")[2];
+  b = b.split(",")[2];
+
+  return a.localeCompare(b);
 }
