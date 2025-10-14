@@ -28,7 +28,7 @@ const RAW_PROXY_LIST_FILE = "./data/RawProxy.txt";
 const PROXY_LIST_FILE = "./data/proxy.txt";
 const IP_RESOLVER_DOMAIN = "myip.ipeek.workers.dev";
 const IP_RESOLVER_PATH = "/";
-const CONCURRENCY = 50; // Reduced for stability
+const CONCURRENCY = 99; // Reduced for stability
 
 async function sendRequest(host: string, path: string, proxy: any = null) {
   return new Promise((resolve, reject) => {
