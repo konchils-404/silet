@@ -26,7 +26,7 @@ let myGeoIpString: any = null;
 const KV_PAIR_PROXY_FILE = "./data/KvProxy.json";
 const RAW_PROXY_LIST_FILE = "./data/RawProxy.txt";
 const PROXY_LIST_FILE = "./data/proxy.txt";
-const IP_RESOLVER_DOMAIN = "myip.ipeek.workers.dev";
+const IP_RESOLVER_DOMAIN = "myapicheck.mayumiapi.workers.dev";
 const IP_RESOLVER_PATH = "/";
 const CONCURRENCY = 99;
 
